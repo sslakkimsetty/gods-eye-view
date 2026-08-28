@@ -8,6 +8,9 @@ import {
   frameLoudness,
   parseChatToolCalls,
   readLocalVoiceStatus,
+  speechThreshold,
+  SPEECH_FLOOR_MIN,
+  SPEECH_FLOOR_MULTIPLIER,
 } from './gevLocalVoice.js';
 
 test('loudness separates speech-level audio from room tone', () => {
@@ -137,4 +140,24 @@ test('microphone failures name a cause the user can act on', () => {
   assert.match(describeMicError({ name: 'AbortError' }), /Try again/);
   assert.match(describeMicError({ name: 'WeirdNewError' }), /WeirdNewError/, 'unknown names are surfaced, not swallowed');
   assert.match(describeMicError(undefined), /unknown error/);
+});
+
+test('the speech gate adapts to the room but never drops below the floor', () => {
+  // Silent room: the floor keeps the gate off the noise.
+  assert.equal(speechThreshold(0), SPEECH_FLOOR_MIN);
+  assert.equal(speechThreshold(0.0001), SPEECH_FLOOR_MIN);
+
+  // Noisy room: the gate rises above the measured tone rather than latching open.
+  const noisy = 0.02;
+  assert.equal(speechThreshold(noisy), noisy * SPEECH_FLOOR_MULTIPLIER);
+  assert.ok(speechThreshold(noisy) > noisy, 'gate must sit above the noise it measured');
+
+  // Monotonic: a louder room never yields a lower gate.
+  assert.ok(speechThreshold(0.05) > speechThreshold(0.01));
+});
+
+test('a quiet mic still opens the gate at conversational level', () => {
+  // A heavily noise-suppressed laptop mic idles around 0.001 and speaks near 0.02.
+  const gate = speechThreshold(0.001);
+  assert.ok(gate < 0.02, `speech at 0.02 must clear the gate, got ${gate}`);
 });

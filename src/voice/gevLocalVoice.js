@@ -29,8 +29,31 @@ const STATUS_URL = '/api/voice/status';
 
 /** parakeet's native rate. Capturing here avoids a resample server-side. */
 export const CAPTURE_SAMPLE_RATE = 16000;
-/** Mean absolute amplitude above which a frame counts as speech. */
-export const SPEECH_RMS_THRESHOLD = 0.012;
+/**
+ * Absolute floor for the speech gate.
+ *
+ * A fixed threshold is fragile: getUserMedia's noiseSuppression and
+ * echoCancellation both pull levels down, and headset vs. laptop mics differ by
+ * an order of magnitude. So this is only the lower bound -- the live gate is
+ * derived from the measured noise floor, see speechThreshold().
+ */
+export const SPEECH_FLOOR_MIN = 0.004;
+/** Speech must exceed the noise floor by this factor to open the gate. */
+export const SPEECH_FLOOR_MULTIPLIER = 3.5;
+/** Seed noise floor before any audio has been observed. */
+export const NOISE_FLOOR_SEED = 0.002;
+/** How fast the noise-floor estimate tracks the room. */
+export const NOISE_FLOOR_ALPHA = 0.05;
+
+/**
+ * Gate level for a given noise floor.
+ *
+ * @param {number} noiseFloor
+ * @returns {number}
+ */
+export function speechThreshold(noiseFloor) {
+  return Math.max(SPEECH_FLOOR_MIN, noiseFloor * SPEECH_FLOOR_MULTIPLIER);
+}
 /** Silence that ends an utterance. Long enough to survive a mid-sentence pause. */
 export const SILENCE_HOLD_MS = 900;
 /** Ignore blips shorter than this — a cough or a key click is not a command. */
@@ -184,6 +207,27 @@ export class GevLocalVoiceController {
     this.utteranceMs = 0;
     /** Latched while a turn is in flight so speech during playback is ignored. */
     this.busy = false;
+    /** Running estimate of room tone, used to derive the speech gate. */
+    this.noiseFloor = NOISE_FLOOR_SEED;
+    /** Diagnostics, surfaced through window.__gevVoiceDebug(). */
+    this.stats = { frames: 0, peak: 0, lastLoudness: 0, utterances: 0, sampleRate: null };
+    this.lastMeterAt = 0;
+  }
+
+  /** Live capture diagnostics — the first thing to check when nothing happens. */
+  debug() {
+    return {
+      active: this.active,
+      busy: this.busy,
+      speaking: this.speaking,
+      framesSeen: this.stats.frames,
+      sampleRate: this.stats.sampleRate,
+      lastLoudness: Number(this.stats.lastLoudness.toFixed(5)),
+      peakLoudness: Number(this.stats.peak.toFixed(5)),
+      noiseFloor: Number(this.noiseFloor.toFixed(5)),
+      speechThreshold: Number(speechThreshold(this.noiseFloor).toFixed(5)),
+      utterancesSent: this.stats.utterances,
+    };
   }
 
   isActive() {
@@ -199,6 +243,16 @@ export class GevLocalVoiceController {
   setError(message) {
     this.setStatus('error');
     if (this.ui?.errorDetail) this.ui.errorDetail.textContent = message;
+  }
+
+  /** Throttled input-level readout, so a silent mic is visible rather than guessed at. */
+  showMeter(loudness) {
+    const now = Date.now();
+    if (now - this.lastMeterAt < 120) return;
+    this.lastMeterAt = now;
+    const gate = speechThreshold(this.noiseFloor);
+    const bars = Math.min(10, Math.round((loudness / Math.max(gate, 1e-6)) * 5));
+    this.setStatus('listening', `${'\u2588'.repeat(bars).padEnd(10, '\u00b7')} speak to command`);
   }
 
   async start() {
@@ -248,6 +302,11 @@ export class GevLocalVoiceController {
       return;
     }
 
+    this.stats.sampleRate = this.audioContext.sampleRate;
+    if (this.audioContext.sampleRate !== CAPTURE_SAMPLE_RATE) {
+      // Not fatal: the service resamples. Worth knowing while debugging though.
+      console.info(`[gev-voice] capturing at ${this.audioContext.sampleRate} Hz`);
+    }
     this.active = true;
     this.resetUtterance();
     this.setStatus('listening', this.model ? `Listening — ${this.model}` : 'Listening');
@@ -287,11 +346,23 @@ export class GevLocalVoiceController {
    */
   onFrame(frame) {
     if (!this.active || this.busy || !frame?.length) return;
-    const frameMs = (frame.length / CAPTURE_SAMPLE_RATE) * 1000;
-    const loud = frameLoudness(frame) > SPEECH_RMS_THRESHOLD;
+    // Use the context's ACTUAL rate: a browser may refuse the requested 16 kHz,
+    // and timing computed from the wrong rate silently breaks the silence hold.
+    const rate = this.audioContext?.sampleRate || CAPTURE_SAMPLE_RATE;
+    const frameMs = (frame.length / rate) * 1000;
+    const loudness = frameLoudness(frame);
 
+    this.stats.frames += 1;
+    this.stats.lastLoudness = loudness;
+    if (loudness > this.stats.peak) this.stats.peak = loudness;
+
+    const loud = loudness > speechThreshold(this.noiseFloor);
     if (!this.speaking) {
-      if (!loud) return; // still waiting for speech to begin
+      // Track room tone only while nobody is talking, so speech cannot raise
+      // the floor and gate itself out.
+      this.noiseFloor += NOISE_FLOOR_ALPHA * (loudness - this.noiseFloor);
+      this.showMeter(loudness);
+      if (!loud) return;
       this.speaking = true;
     }
 
@@ -306,18 +377,21 @@ export class GevLocalVoiceController {
     const spokenMs = this.utteranceMs - this.silenceMs;
     this.resetUtterance();
     if (spokenMs < MIN_UTTERANCE_MS) return; // a click or a cough
-    void this.runTurn(flattenFrames(frames));
+    this.stats.utterances += 1;
+    void this.runTurn(flattenFrames(frames), rate);
   }
 
   /**
    * One full turn: transcribe, route, execute, confirm.
    * @param {Float32Array} samples
    */
-  async runTurn(samples) {
+  async runTurn(samples, sampleRate = CAPTURE_SAMPLE_RATE) {
     this.busy = true;
     try {
       this.setStatus('thinking', 'Transcribing');
-      const wav = encodeWav(samples);
+      // Label the WAV with the rate it was actually captured at. Mislabelling
+      // here does not error -- it just transcribes as gibberish.
+      const wav = encodeWav(samples, sampleRate);
       const sttResponse = await fetch(STT_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'audio/wav' },
@@ -491,5 +565,7 @@ export function initGevLocalVoiceCommands({
   if (ui.tierButton) ui.tierButton.style.display = 'none';
   if (ui.costValue) ui.costValue.textContent = 'local';
   window.__gevVoiceCommands = controller;
+  // Capture diagnostics without opening devtools sources: __gevVoiceDebug()
+  window.__gevVoiceDebug = () => controller.debug();
   return controller;
 }
