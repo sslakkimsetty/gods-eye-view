@@ -203,6 +203,16 @@ export class GevLocalVoiceController {
 
   async start() {
     if (this.active) return;
+    if (!window.isSecureContext) {
+      // getUserMedia is gated on a secure context. A LAN IP or a .local
+      // hostname fails here with the same NotAllowedError as a real denial,
+      // so name it separately -- the fix is completely different.
+      this.setError(
+        `Microphone needs a secure context. Open this over https, http://localhost, `
+        + `or http://127.0.0.1 — not ${window.location.origin}.`,
+      );
+      return;
+    }
     if (!navigator.mediaDevices?.getUserMedia || !window.AudioContext) {
       this.setError('This browser cannot capture microphone audio.');
       return;
@@ -213,7 +223,7 @@ export class GevLocalVoiceController {
         audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
       });
     } catch (error) {
-      this.setError(`Microphone permission denied (${error?.name || 'error'}).`);
+      this.setError(describeMicError(error));
       return;
     }
 
@@ -386,6 +396,34 @@ export class GevLocalVoiceController {
       if (url) URL.revokeObjectURL(url);
       this.player = null;
     }
+  }
+}
+
+/**
+ * Turn a getUserMedia rejection into something the user can act on.
+ *
+ * The DOMException name is the only reliable signal, and the two common causes
+ * of NotAllowedError -- a site permission the browser remembered, and a missing
+ * OS-level grant for the browser itself -- need different fixes, so both are
+ * named rather than guessed between.
+ *
+ * @param {unknown} error
+ * @returns {string}
+ */
+export function describeMicError(error) {
+  switch (error?.name) {
+    case 'NotAllowedError':
+      return 'Microphone blocked. Allow it for this site (padlock in the address bar), '
+        + 'and check System Settings > Privacy & Security > Microphone for your browser.';
+    case 'NotFoundError':
+    case 'OverconstrainedError':
+      return 'No microphone found. Connect one and try again.';
+    case 'NotReadableError':
+      return 'The microphone is in use by another app. Close it and try again.';
+    case 'AbortError':
+      return 'The microphone could not be started. Try again.';
+    default:
+      return `Microphone unavailable (${error?.name || 'unknown error'}).`;
   }
 }
 

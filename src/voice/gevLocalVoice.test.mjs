@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   CAPTURE_SAMPLE_RATE,
+  describeMicError,
   describeOutcomes,
   encodeWav,
   frameLoudness,
@@ -124,4 +125,16 @@ test('voice status reports disabled when unconfigured, unreachable, or malformed
 
   const threw = await readLocalVoiceStatus(async () => { throw new Error('offline'); });
   assert.equal(threw.enabled, false, 'a dead server must not break voice init');
+});
+
+test('microphone failures name a cause the user can act on', () => {
+  const denied = describeMicError({ name: 'NotAllowedError' });
+  assert.match(denied, /address bar/, 'points at the site permission');
+  assert.match(denied, /System Settings/, 'and at the OS grant, which is the other common cause');
+
+  assert.match(describeMicError({ name: 'NotFoundError' }), /No microphone/);
+  assert.match(describeMicError({ name: 'NotReadableError' }), /in use by another app/);
+  assert.match(describeMicError({ name: 'AbortError' }), /Try again/);
+  assert.match(describeMicError({ name: 'WeirdNewError' }), /WeirdNewError/, 'unknown names are surfaced, not swallowed');
+  assert.match(describeMicError(undefined), /unknown error/);
 });
