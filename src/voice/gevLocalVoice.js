@@ -61,6 +61,41 @@ export const MIN_UTTERANCE_MS = 350;
 /** Hard stop so a stuck-open mic cannot upload unbounded audio. */
 export const MAX_UTTERANCE_MS = 15000;
 
+/**
+ * Character budget for retained conversation.
+ *
+ * Follow-ups like "identify a bridge there" only work if the model can see the
+ * previous turn, so history is kept -- but a voice session is long-lived and
+ * tool results are verbose, so it is bounded rather than unbounded.
+ */
+export const MAX_HISTORY_CHARS = 6000;
+/** Tool results are summaries for the model, not transcripts. */
+export const MAX_TOOL_RESULT_CHARS = 800;
+
+/**
+ * Drop whole exchanges from the front until the history fits the budget.
+ *
+ * Trims only to a `user` boundary: a `tool` message orphaned from its
+ * `assistant` tool_calls is a protocol error on most servers, so half an
+ * exchange must never be left at the head.
+ *
+ * @param {Array<object>} history
+ * @param {number} budget
+ * @returns {Array<object>} the same array, trimmed in place
+ */
+export function trimHistory(history, budget = MAX_HISTORY_CHARS) {
+  const size = () => history.reduce(
+    (total, message) => total + String(message.content || '').length
+      + (message.tool_calls ? JSON.stringify(message.tool_calls).length : 0),
+    0,
+  );
+  while (history.length > 1 && size() > budget) {
+    history.shift();
+    while (history.length && history[0].role !== 'user') history.shift();
+  }
+  return history;
+}
+
 const STATUS_TEXT = {
   idle: 'OFF',
   listening: 'LISTENING',
@@ -177,10 +212,12 @@ function humanizeToolName(name) {
  */
 export function parseChatToolCalls(data) {
   const choice = data?.choices?.[0] ?? {};
-  const calls = (choice.message?.tool_calls ?? []).map((call) => {
+  const calls = (choice.message?.tool_calls ?? []).map((call, index) => {
     let args = {};
     try { args = JSON.parse(call.function?.arguments || '{}'); } catch { args = {}; }
-    return { name: call.function?.name, args };
+    // The id is how a tool result is matched back to its call. Servers that omit
+    // it still need a stable handle, so synthesize one.
+    return { id: call.id || `call_${index}`, name: call.function?.name, args, raw: call };
   }).filter((call) => call.name);
   return {
     calls,
@@ -209,9 +246,16 @@ export class GevLocalVoiceController {
     this.busy = false;
     /** Running estimate of room tone, used to derive the speech gate. */
     this.noiseFloor = NOISE_FLOOR_SEED;
+    /** Conversation so far, so follow-ups such as "there" can resolve. */
+    this.history = [];
     /** Diagnostics, surfaced through window.__gevVoiceDebug(). */
     this.stats = { frames: 0, peak: 0, lastLoudness: 0, utterances: 0, sampleRate: null };
     this.lastMeterAt = 0;
+  }
+
+  /** Start a fresh conversation without restarting the microphone. */
+  resetConversation() {
+    this.history = [];
   }
 
   /** Live capture diagnostics — the first thing to check when nothing happens. */
@@ -227,6 +271,7 @@ export class GevLocalVoiceController {
       noiseFloor: Number(this.noiseFloor.toFixed(5)),
       speechThreshold: Number(speechThreshold(this.noiseFloor).toFixed(5)),
       utterancesSent: this.stats.utterances,
+      historyMessages: this.history.length,
     };
   }
 
@@ -405,30 +450,56 @@ export class GevLocalVoiceController {
       }
       this.setStatus('thinking', transcript);
 
+      this.history.push({ role: 'user', content: transcript });
+      trimHistory(this.history);
+
       const chatResponse = await fetch(CHAT_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages: [{ role: 'user', content: transcript }] }),
+        body: JSON.stringify({ messages: this.history }),
       });
       if (!chatResponse.ok) throw new Error(`Voice model failed (${chatResponse.status})`);
       const { calls, text, truncated } = parseChatToolCalls(await chatResponse.json());
 
       if (!calls.length) {
-        // Conversational turn, or the model ran out of room mid-call.
-        await this.speak(truncated ? 'Sorry, I lost that one.' : (text || 'I did not catch a command.'));
+        // Conversational turn, or the model ran out of room mid-call. Either way
+        // it is part of the conversation and belongs in the history.
+        const reply = truncated ? 'Sorry, I lost that one.' : (text || 'I did not catch a command.');
+        this.history.push({ role: 'assistant', content: reply });
+        await this.speak(reply);
         return;
       }
+
+      // Record the assistant turn BEFORE executing, so that a tool which throws
+      // still leaves a well-formed call/response pair behind it.
+      this.history.push({
+        role: 'assistant',
+        content: text || '',
+        tool_calls: calls.map((call) => call.raw),
+      });
 
       this.setStatus('executing', calls.map((c) => c.name).join(', '));
       const outcomes = [];
       for (const call of calls) {
+        let payload;
         try {
           const result = await this.runner(call.name, call.args);
           outcomes.push({ name: call.name, result, error: null });
+          payload = result;
         } catch (error) {
-          outcomes.push({ name: call.name, result: null, error: String(error?.message || error) });
+          const message = String(error?.message || error);
+          outcomes.push({ name: call.name, result: null, error: message });
+          payload = { ok: false, error: message };
         }
+        // Feed the real outcome back. This is what lets "identify a bridge
+        // there" resolve: the model can see it flew to Boston and what came of it.
+        this.history.push({
+          role: 'tool',
+          tool_call_id: call.id,
+          content: JSON.stringify(payload ?? null).slice(0, MAX_TOOL_RESULT_CHARS),
+        });
       }
+      trimHistory(this.history);
       await this.speak(describeOutcomes(outcomes));
     } catch (error) {
       this.setError(String(error?.message || error));

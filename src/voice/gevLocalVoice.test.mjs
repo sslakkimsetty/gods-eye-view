@@ -9,6 +9,8 @@ import {
   parseChatToolCalls,
   readLocalVoiceStatus,
   speechThreshold,
+  trimHistory,
+  MAX_HISTORY_CHARS,
   SPEECH_FLOOR_MIN,
   SPEECH_FLOOR_MULTIPLIER,
 } from './gevLocalVoice.js';
@@ -60,7 +62,9 @@ test('tool calls and their arguments are parsed out of a chat response', () => {
     }],
   });
   assert.equal(parsed.calls.length, 2);
-  assert.deepEqual(parsed.calls[0], { name: 'fly_to_location', args: { locationId: 'tokyo' } });
+  assert.equal(parsed.calls[0].name, 'fly_to_location');
+  assert.deepEqual(parsed.calls[0].args, { locationId: 'tokyo' });
+  assert.ok(parsed.calls[0].id, 'a call id is required to answer with role:"tool"');
   assert.equal(parsed.calls[1].args.enabled, true);
   assert.equal(parsed.truncated, false);
 });
@@ -69,7 +73,9 @@ test('malformed arguments degrade to an empty object rather than throwing', () =
   const parsed = parseChatToolCalls({
     choices: [{ message: { tool_calls: [{ function: { name: 'zoom_to_globe', arguments: '{not json' } }] } }],
   });
-  assert.deepEqual(parsed.calls, [{ name: 'zoom_to_globe', args: {} }]);
+  assert.equal(parsed.calls.length, 1);
+  assert.equal(parsed.calls[0].name, 'zoom_to_globe');
+  assert.deepEqual(parsed.calls[0].args, {});
 });
 
 test('a truncated turn is flagged so it can be reported instead of silently dropped', () => {
@@ -160,4 +166,48 @@ test('a quiet mic still opens the gate at conversational level', () => {
   // A heavily noise-suppressed laptop mic idles around 0.001 and speaks near 0.02.
   const gate = speechThreshold(0.001);
   assert.ok(gate < 0.02, `speech at 0.02 must clear the gate, got ${gate}`);
+});
+
+test('missing tool_call ids are synthesized so results can still be matched back', () => {
+  const parsed = parseChatToolCalls({
+    choices: [{ message: { tool_calls: [
+      { function: { name: 'fly_to_location', arguments: '{}' } },
+      { function: { name: 'set_hud', arguments: '{}' } },
+    ] } }],
+  });
+  assert.equal(parsed.calls.length, 2);
+  assert.notEqual(parsed.calls[0].id, parsed.calls[1].id, 'synthesized ids must be distinct');
+});
+
+test('history under budget is left alone', () => {
+  const history = [
+    { role: 'user', content: 'fly to boston' },
+    { role: 'assistant', content: '', tool_calls: [{ id: 'a' }] },
+    { role: 'tool', tool_call_id: 'a', content: '{"ok":true}' },
+  ];
+  assert.equal(trimHistory([...history]).length, 3);
+});
+
+test('trimming never orphans a tool message from its call', () => {
+  const exchange = (n) => ([
+    { role: 'user', content: `turn ${n} `.padEnd(400, 'x') },
+    { role: 'assistant', content: '', tool_calls: [{ id: `c${n}` }] },
+    { role: 'tool', tool_call_id: `c${n}`, content: '{"ok":true}' },
+  ]);
+  const history = [...exchange(1), ...exchange(2), ...exchange(3), ...exchange(4)];
+  const trimmed = trimHistory(history, 900);
+
+  assert.ok(trimmed.length < 12, 'something was dropped');
+  assert.equal(trimmed[0].role, 'user', 'head must be a user turn, never a dangling tool result');
+  for (let i = 0; i < trimmed.length; i += 1) {
+    if (trimmed[i].role === 'tool') {
+      const prior = trimmed.slice(0, i).some((m) => m.role === 'assistant');
+      assert.ok(prior, 'every retained tool message still has its assistant turn ahead of it');
+    }
+  }
+});
+
+test('a single oversized exchange is not trimmed into nothing', () => {
+  const history = [{ role: 'user', content: 'x'.repeat(MAX_HISTORY_CHARS * 2) }];
+  assert.equal(trimHistory(history).length, 1, 'the current turn always survives');
 });
