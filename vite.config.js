@@ -4963,6 +4963,151 @@ function trackBackfillProxies() {
 }
 
 /**
+ * Local voice services, when configured.
+ *
+ * @returns {{stt: string, tts: string, llm: string, model: string}|null}
+ */
+export function resolveLocalVoiceTargets() {
+  const stt = String(process.env.GEV_VOICE_STT_URL || '').trim().replace(/\/+$/, '');
+  const tts = String(process.env.GEV_VOICE_TTS_URL || '').trim().replace(/\/+$/, '');
+  const llm = String(process.env.GEV_VOICE_LLM_BASE_URL || '').trim().replace(/\/+$/, '');
+  if (!stt || !tts || !llm) return null;
+  return { stt, tts, llm, model: process.env.GEV_VOICE_LLM_MODEL || '' };
+}
+
+/**
+ * Realtime tool defs are flat ({type,name,description,parameters}); the
+ * chat-completions API nests them under `function`.
+ *
+ * @param {Array<object>} tools
+ * @returns {Array<object>}
+ */
+export function toChatCompletionsTools(tools) {
+  return tools.map(({ type, name, description, parameters }) => ({
+    type: type || 'function',
+    function: { name, description, parameters },
+  }));
+}
+
+/**
+ * Vite plugin: local voice pipeline proxy (STT / chat / TTS).
+ *
+ * Inert unless GEV_VOICE_STT_URL, GEV_VOICE_TTS_URL, and GEV_VOICE_LLM_BASE_URL
+ * are all set. Same-origin like every other provider proxy here, so the browser
+ * never learns the service addresses and no CORS config is needed.
+ *
+ * @returns {import('vite').Plugin}
+ */
+function localVoiceProxy() {
+  const AUDIO_LIMIT_BYTES = 10 * 1024 * 1024;
+
+  /** Report configuration state so the client can disable the mic cleanly. */
+  function sendUnconfigured(res) {
+    res.statusCode = 503;
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ error: 'Local voice is not configured' }));
+  }
+
+  function install(middlewares) {
+    middlewares.use('/api/voice/status', (req, res) => {
+      const targets = resolveLocalVoiceTargets();
+      res.statusCode = 200;
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader('Cache-Control', 'no-store');
+      res.end(JSON.stringify({ enabled: Boolean(targets), model: targets?.model || null }));
+    });
+
+    middlewares.use('/api/voice/stt', async (req, res) => {
+      if (req.method !== 'POST') { res.statusCode = 405; res.end(); return; }
+      const targets = resolveLocalVoiceTargets();
+      if (!targets) return sendUnconfigured(res);
+      try {
+        const audio = await readRequestBodyCapped(req, AUDIO_LIMIT_BYTES);
+        const upstream = await fetch(`${targets.stt}/stt`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'audio/wav' },
+          body: audio,
+        });
+        const text = await upstream.text();
+        res.statusCode = upstream.status;
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-store');
+        res.end(text);
+      } catch (error) {
+        res.statusCode = 502;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ error: String(error?.message || 'STT proxy failed') }));
+      }
+    });
+
+    middlewares.use('/api/voice/chat', async (req, res) => {
+      if (req.method !== 'POST') { res.statusCode = 405; res.end(); return; }
+      const targets = resolveLocalVoiceTargets();
+      if (!targets) return sendUnconfigured(res);
+      try {
+        const body = await readRequestBody(req, 256 * 1024);
+        const request = JSON.parse(body || '{}');
+        // Tools and instructions are supplied SERVER-side from the same
+        // constants the Realtime session uses, so the browser cannot send a
+        // divergent tool set and the two transports cannot drift apart.
+        const upstream = await fetch(`${targets.llm}/chat/completions`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: targets.model || undefined,
+            messages: [
+              { role: 'system', content: GEV_LOCAL_VOICE_INSTRUCTIONS },
+              ...(Array.isArray(request.messages) ? request.messages : []),
+            ],
+            tools: toChatCompletionsTools(GEV_REALTIME_TOOLS),
+            temperature: 0,
+            max_tokens: 600,
+          }),
+        });
+        const text = await upstream.text();
+        res.statusCode = upstream.status;
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-store');
+        res.end(text);
+      } catch (error) {
+        res.statusCode = 502;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ error: String(error?.message || 'Voice chat proxy failed') }));
+      }
+    });
+
+    middlewares.use('/api/voice/tts', async (req, res) => {
+      if (req.method !== 'POST') { res.statusCode = 405; res.end(); return; }
+      const targets = resolveLocalVoiceTargets();
+      if (!targets) return sendUnconfigured(res);
+      try {
+        const body = await readRequestBody(req, 16 * 1024);
+        const upstream = await fetch(`${targets.tts}/tts`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: body || '{}',
+        });
+        const audio = Buffer.from(await upstream.arrayBuffer());
+        res.statusCode = upstream.status;
+        res.setHeader('Content-Type', upstream.headers.get('content-type') || 'audio/wav');
+        res.setHeader('Cache-Control', 'no-store');
+        res.end(audio);
+      } catch (error) {
+        res.statusCode = 502;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ error: String(error?.message || 'TTS proxy failed') }));
+      }
+    });
+  }
+
+  return {
+    name: 'local-voice-proxy',
+    configureServer(server) { install(server.middlewares); },
+    configurePreviewServer(server) { install(server.middlewares); },
+  };
+}
+
+/**
  * Resolve which backend serves the AI HUD summary.
  *
  * Setting GEV_HUD_SUMMARY_BASE_URL routes the summary at any OpenAI-compatible
@@ -5553,6 +5698,35 @@ function approximateDistanceM(latA, lonA, latB, lonB) {
  * Module-level so QA harnesses can evaluate routing against the PRODUCTION
  * prompt rather than a drifting copy.
  */
+/**
+ * System prompt for the LOCAL voice pipeline.
+ *
+ * Deliberately not GEV_REALTIME_INSTRUCTIONS. That prompt is ~18.6k characters
+ * tuned against the OpenAI Realtime model, and scripts/qa-voice-routing-local.mjs
+ * measured it costing a local model 8 points of routing accuracy (51/62 vs 56/62
+ * on a 4-line prompt) -- mostly by suppressing the second call on compound
+ * requests. But the bare slim prompt loses app-specific disambiguation the long
+ * one encodes on purpose.
+ *
+ * So this keeps the rules the eval proved necessary and drops the prose. Any
+ * edit here should be scored with:
+ *   node scripts/qa-voice-routing-local.mjs --prompt local
+ */
+export const GEV_LOCAL_VOICE_INSTRUCTIONS = [
+  "You control God's Eye View, a photorealistic 3D globe, by calling tools.",
+  'Call the tool or tools needed to satisfy the request. Never invent tool names or arguments.',
+  'For ordinary conversation that is not a control request, answer normally and call no tool.',
+  'A request naming two intents gets two calls, emitted together in ONE response. This holds even when one of them is a whole-view action: "turn off the HUD and take me to Paris" is set_hud AND fly_to_location; "go to full planet view and then turn on the radio" is zoom_to_globe AND control_radio. Never stop after the first call.',
+  'To OPEN, SHOW, or REVEAL a menu or panel, call show_data_layers_menu or set_panel_open. "Show me the datacenter layers" opens the menu; it does NOT enable the layer. Only call set_layer_visibility when asked to turn something on or off.',
+  'For "what am I looking at?", "what is this?", or questions about a selected object, call get_entity_context.',
+  'To FOLLOW or TRACK an object the user points at ("track that plane", "follow it"), call track_entity. A lookup alone does not satisfy a track request.',
+  'For public-camera requests -- nearest camera, show me a camera, cycle cameras, camera coverage -- call control_cctv, not set_layer_visibility.',
+  'For analytical questions about layer data -- how many, which, biggest, nearest, fastest -- call analyst_query.',
+  'To remove drawn marks, call clear_annotations. Only when the user explicitly asks to clear or reset the map.',
+  'Visual style names are internal and do not match how people speak. Map them: night vision / NVG / green -> surveillance; thermal / FLIR / infrared / heat -> thermal; CRT / retro / scanlines -> retro; noir / black and white -> noir; snow -> snow; anime -> anime; normal / default / back to normal -> normal.',
+  'Keep spoken confirmations short: "Flying to London", "Night vision on".',
+].join('\n');
+
 export const GEV_REALTIME_INSTRUCTIONS = [
             "You are GEV Voice Control, a concise voice controller for a Cesium geospatial app called God's Eye View.",
             'Have a natural spoken conversation with the user while the mic session is active.',
@@ -7446,6 +7620,7 @@ export default defineConfig(({ mode }) => {
       aisLiveProxy(),
       trackBackfillProxies(),
       openAiRealtimeProxy(),
+      localVoiceProxy(),
       googlePlacesContextProxy(),
     ],
     server: {

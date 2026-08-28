@@ -18,7 +18,8 @@ import localDataLayers from './data/localLayers.js';
 import { LAYER_STATE_REGISTRY } from './data/layerState.js';
 import { registerDataCredits } from './data/dataCredits.js';
 import { SceneDirector } from './scenes/director.js';
-import { initGevVoiceCommands } from './voice/gevRealtime.js';
+import { createVoiceControl, initGevVoiceCommands } from './voice/gevRealtime.js';
+import { initGevLocalVoiceCommands, readLocalVoiceStatus } from './voice/gevLocalVoice.js';
 import { MapStackController } from './mapStackController.js';
 import { initAnnotations } from './annotations/index.js';
 import { initLogoGaze } from './logoGaze.js';
@@ -324,7 +325,17 @@ async function init() {
       getRenderGovernorDiagnostics,
       requestRender: governorRequestRender,
     };
-    window.__godsEyeView.voiceCommands = initGevVoiceCommands({ viewer, styleManager, dataManager, sceneDirector, annotations });
+    // Local voice wins when configured: it needs no API key and no per-turn
+    // spend. Falling through to the Realtime transport keeps stock installs
+    // unchanged, so this is inert unless GEV_VOICE_* are set.
+    const localVoice = await readLocalVoiceStatus();
+    window.__godsEyeView.voiceCommands = localVoice.enabled
+      ? initGevLocalVoiceCommands({
+        viewer, styleManager, dataManager, sceneDirector, annotations,
+        ui: createVoiceControl({ reset: true }),
+        model: localVoice.model,
+      })
+      : initGevVoiceCommands({ viewer, styleManager, dataManager, sceneDirector, annotations });
 
   } catch (error) {
     console.error("God's Eye View initialization failed:", error);

@@ -17,7 +17,8 @@
  * Usage:
  *   node scripts/qa-voice-routing-local.mjs
  *   node scripts/qa-voice-routing-local.mjs --model mlx-community/Qwen3.6-35B-A3B-6bit
- *   node scripts/qa-voice-routing-local.mjs --prompt slim      # trimmed system prompt
+ *   node scripts/qa-voice-routing-local.mjs --prompt full|slim|local
+ *       full  = the Realtime prompt, slim = a 4-line control, local = what ships
  *   node scripts/qa-voice-routing-local.mjs --only Tokyo       # substring filter
  *   node scripts/qa-voice-routing-local.mjs --jsonl runs/local.jsonl
  *
@@ -27,7 +28,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { GEV_REALTIME_INSTRUCTIONS, GEV_REALTIME_TOOLS } from '../vite.config.js';
+import {
+  GEV_LOCAL_VOICE_INSTRUCTIONS,
+  GEV_REALTIME_INSTRUCTIONS,
+  GEV_REALTIME_TOOLS,
+} from '../vite.config.js';
 import { PHRASES } from './voiceRoutingPhrases.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -39,7 +44,7 @@ function getOpt(flag, fallback) {
 }
 const BASE_URL = getOpt('--url', process.env.GEV_VOICE_LLM_BASE_URL || 'http://127.0.0.1:11452/v1');
 const MODEL = getOpt('--model', process.env.GEV_VOICE_LLM_MODEL || 'mlx-community/Qwen3.6-35B-A3B-6bit');
-const PROMPT_MODE = getOpt('--prompt', 'full'); // full | slim
+const PROMPT_MODE = getOpt('--prompt', 'local'); // full | slim | local
 const ONLY = getOpt('--only', null);
 const JSONL = getOpt('--jsonl', null);
 const MAX_TOKENS = Number(getOpt('--max-tokens', '600'));
@@ -173,7 +178,11 @@ async function routePhrase(phrase, tools, systemPrompt) {
 
 async function main() {
   const tools = toChatCompletionsTools(GEV_REALTIME_TOOLS);
-  const systemPrompt = PROMPT_MODE === 'slim' ? SLIM_INSTRUCTIONS : GEV_REALTIME_INSTRUCTIONS;
+  const systemPrompt = {
+    slim: SLIM_INSTRUCTIONS,
+    local: GEV_LOCAL_VOICE_INSTRUCTIONS,
+    full: GEV_REALTIME_INSTRUCTIONS,
+  }[PROMPT_MODE] ?? GEV_LOCAL_VOICE_INSTRUCTIONS;
   const phrases = ONLY
     ? PHRASES.filter((p) => p.phrase.toLowerCase().includes(ONLY.toLowerCase()))
     : PHRASES;
