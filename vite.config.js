@@ -26,7 +26,9 @@
  */
 
 import fs from 'node:fs';
+import os from 'node:os';
 import { promises as fsp } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { Readable } from 'node:stream';
@@ -53,6 +55,18 @@ import {
 import { normalizeAdsbLolPointResponse } from './src/data/adsbLolFallback.js';
 import { createAisStreamAdapter, isRecognizedAisEnvelope } from './src/data/aisStreamAdapter.js';
 import { parseSilenceTimeoutEnv } from './src/data/aisWatchdog.js';
+import { keylessHudSummaryResponse } from './src/hudSummaryResponse.js';
+import { parseEnv as parseDotenvText } from 'node:util';
+import { readEnvironmentSource as readPinokioEnvironmentSource } from './scripts/pinokio-environment.mjs';
+import {
+  admitKeySetupRequest,
+  isKeySetupExternallyManaged,
+  keySetupStatus,
+  knownKeySetupEnvVars,
+  upsertDotenvValues,
+  validateKeySetupUpdates,
+} from './src/keySetupCore.mjs';
+import { hardenCredentialFile } from './src/keySetupHardening.mjs';
 import {
   fetchTerrainChunkWithRetry,
   parseTerrainPoints,
@@ -64,6 +78,39 @@ import { VOICE_MODELS, isKnownVoiceTier, resolveVoiceModel } from './src/voice/v
 
 /** Resolve __dirname for ESM context. */
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+/**
+ * Which launcher started this process, captured at MODULE LOAD — before the
+ * config factory's loadEnv() copies dotenv files into process.env. Provider
+ * Settings uses this to decide which credential store it owns, so it must
+ * reflect the real launcher (scripts/pinokio-start.mjs sets it) and never a
+ * value a project `.env` could inject.
+ */
+const LAUNCHER_AT_BOOT = process.env.GEV_LAUNCHER;
+
+/**
+ * Provider values present before Vite loads the checkout's dotenv files.
+ * Memoized on globalThis: a panel save sets its values live on process.env and
+ * then calls server.restart(), which re-evaluates this config IN-PROCESS.
+ * Recomputing the snapshot there would classify the panel's own keys as
+ * external (read-only) until the whole process is relaunched.
+ */
+const PROVIDER_ENV_AT_BOOT = globalThis.__GEV_PROVIDER_ENV_AT_BOOT ??= Object.freeze(Object.fromEntries(
+  [...knownKeySetupEnvVars()].map((name) => [name, String(process.env[name] ?? '').trim()]),
+));
+
+/**
+ * `dev-fresh.sh` resolves dotenv and Keychain values before it starts Vite, so
+ * it supplies an explicit names-only provenance marker for values inherited
+ * from its parent shell. Plain Vite launches use the raw boot snapshot above;
+ * Pinokio deliberately treats its app-scoped ENVIRONMENT as authoritative.
+ */
+const DEV_FRESH_EXTERNAL_KEYS_AT_BOOT = new Set(
+  String(process.env.GEV_KEY_SETUP_EXTERNAL_KEYS ?? '')
+    .split(',')
+    .map((name) => name.trim())
+    .filter((name) => knownKeySetupEnvVars().has(name)),
+);
 
 // ---------------------------------------------------------------------------
 // OpenSky OAuth2 token + response cache state
@@ -295,11 +342,14 @@ function overpassDiskPath(cacheKey) {
  * serve-stale path when every mirror is down).
  * @returns {Promise<?Object>} Payload with cachedAt, or null.
  */
-async function readOverpassDisk(cacheKey, maxAgeMs) {
+export async function readOverpassDisk(cacheKey, maxAgeMs) {
   try {
     const raw = await fsp.readFile(overpassDiskPath(cacheKey), 'utf8');
     const payload = JSON.parse(raw);
     if (!payload || typeof payload.body !== 'string' || !Number.isFinite(payload.cachedAt)) return null;
+    // Older versions persisted 4xx refusals with normal data TTLs. Ignore
+    // them on both fresh and stale reads so an upgrade can recover immediately.
+    if (!overpassPayloadIsData(payload)) return null;
     if (Date.now() - payload.cachedAt > maxAgeMs) return null;
     return payload;
   } catch {
@@ -340,17 +390,23 @@ export async function resolveOverpassPreflight({
   cacheMs = OVERPASS_CACHE_MS,
 }) {
   const cached = memoryCache.get(cacheKey);
-  if (cached && now - cached.cachedAt <= cacheMs) return { source: 'HIT', payload: cached };
+  if (overpassPayloadIsData(cached) && now - cached.cachedAt <= cacheMs) return { source: 'HIT', payload: cached };
 
   const pending = inFlight.get(cacheKey);
   if (pending) return { source: 'INFLIGHT', payload: await pending };
 
   const disk = await readDisk();
-  if (disk) return { source: 'DISK', payload: disk };
+  if (overpassPayloadIsData(disk)) return { source: 'DISK', payload: disk };
 
   return allowUpstream()
     ? { source: 'UPSTREAM', payload: null }
     : { source: 'RATE_LIMITED', payload: null };
+}
+
+/** Return only last-good Overpass data, regardless of its age. */
+async function readStaleOverpass(cacheKey) {
+  const cached = _overpassCache.get(cacheKey);
+  return overpassPayloadIsData(cached) ? cached : readOverpassDisk(cacheKey, Infinity);
 }
 /** OSM routing (FOSSGIS OSRM) cache: profile|coords -> { payload, cachedAt }. */
 const ROUTE_CACHE_MS = 600000;
@@ -2050,7 +2106,10 @@ function firmsProxy() {
       try {
         const records = filterTrailing24h(await fetchSource(key, source), now);
         sources.push({ source, count: records.length, ok: true });
-        fires.push(...records);
+        // NOT fires.push(...records): spread passes each record as an argument,
+        // and a world/2 VIIRS pull exceeds V8's argument limit (~125k) at
+        // ~131k records — RangeError, and the whole source is silently dropped.
+        for (const record of records) fires.push(record);
       } catch (err) {
         console.warn(`[firms-proxy] ${source} fetch failed:`, err?.message || err);
         sources.push({ source, count: 0, ok: false });
@@ -2509,26 +2568,47 @@ function sendOverpassResponse(res, payload, cacheStatus = 'MISS') {
 }
 
 /**
- * Try each Overpass upstream in order until one succeeds.
+ * True only for an upstream response that is actually Overpass data.
  *
- * Skips rate-limited or 5xx responses and falls through to the next
- * mirror. If all mirrors fail, returns the last rate-limited payload
- * (if any) or throws the last error.
- *
- * @param {string} body - URL-encoded Overpass QL query body.
+ * The proxy caches on this and serves stale on its negation, so the two
+ * decisions cannot drift apart: a payload that is not data must never be
+ * written to the cache and must always be eligible for a stale replacement.
+ * @param {{status: number, rateLimited?: boolean, runtimeError?: boolean}} payload
+ * @returns {boolean}
+ */
+export function overpassPayloadIsData(payload) {
+  const status = Number(payload?.status);
+  return Number.isFinite(status)
+    && status >= 200 && status < 300
+    && !payload.rateLimited
+    && !payload.runtimeError;
+}
+
+/**
+ * Try each mirror once, retaining response-size and per-mirror timeout caps.
+ * Refusals and body-level failures rotate; total failure returns the last
+ * rate-limit payload, otherwise the first refusal, or throws a network error.
+ * @param {string} body URL-encoded Overpass QL query body.
  * @param {number} [maxResponseBytes] Endpoint-specific response cap.
+ * @param {object} [options] Server-only endpoint and I/O overrides for tests.
  * @returns {Promise<{status:number,body:string,contentType:string,endpoint:string,rateLimited:boolean}>}
  */
-async function fetchOverpassPayload(body, maxResponseBytes = OVERPASS_MAX_RESPONSE_BYTES) {
+export async function fetchOverpassPayload(body, maxResponseBytes = OVERPASS_MAX_RESPONSE_BYTES, {
+  endpoints = OVERPASS_UPSTREAMS,
+  fetchImpl = fetch,
+  readBody = readResponseTextCapped,
+  simplify = simplifyOverpassPayloadBody,
+} = {}) {
   let lastError = null;
   let lastRateLimitPayload = null;
+  let lastRefusalPayload = null;
 
-  for (const endpoint of OVERPASS_UPSTREAMS) {
+  for (const endpoint of endpoints) {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), OVERPASS_TIMEOUT_MS);
 
     try {
-      const upstream = await fetch(endpoint, {
+      const upstream = await fetchImpl(endpoint, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/x-www-form-urlencoded',
@@ -2538,7 +2618,7 @@ async function fetchOverpassPayload(body, maxResponseBytes = OVERPASS_MAX_RESPON
         signal: controller.signal,
       });
 
-      const responseBody = await readResponseTextCapped(upstream, maxResponseBytes);
+      const responseBody = await readBody(upstream, maxResponseBytes);
       const contentType = upstream.headers.get('content-type') || 'application/json';
       const status = upstream.status;
       const rateLimited = status === 429 || overpassLooksRateLimited(responseBody);
@@ -2562,14 +2642,23 @@ async function fetchOverpassPayload(body, maxResponseBytes = OVERPASS_MAX_RESPON
         lastError = new Error(`Overpass runtime error (${endpoint})`);
         continue;
       }
-      if (status >= 500) {
+      // Anything but 2xx is this mirror declining, not an answer. Only 5xx used
+      // to rotate, so a 4xx ended the fan-out and was returned — and cached —
+      // as data: overpass-api.de and its lz4 alias answer 406 to this proxy's
+      // User-Agent while kumi.systems and private.coffee answer 200 to the very
+      // same request, so every Overpass-backed layer failed on an Apache error
+      // page with two healthy mirrors untried. The first refusal is kept so a
+      // genuinely bad query still reports what upstream said, but only after
+      // every mirror has had the chance to answer it.
+      if (status < 200 || status >= 300) {
+        if (!lastRefusalPayload) lastRefusalPayload = payload;
         lastError = new Error(`Overpass upstream returned ${status} (${endpoint})`);
         continue;
       }
 
       // Success: decimate giant boundary geometry before it reaches the cache,
       // the disk, or the client (what makes the 32 MB read cap safe to hold).
-      payload.body = simplifyOverpassPayloadBody(payload.body);
+      payload.body = simplify(payload.body);
       return payload;
     } catch (error) {
       lastError = error;
@@ -2579,6 +2668,7 @@ async function fetchOverpassPayload(body, maxResponseBytes = OVERPASS_MAX_RESPON
   }
 
   if (lastRateLimitPayload) return lastRateLimitPayload;
+  if (lastRefusalPayload) return lastRefusalPayload;
   throw lastError || new Error('All Overpass upstreams failed');
 }
 
@@ -2653,6 +2743,15 @@ function overpassProxy() {
             return;
           }
           if (preflight.source !== 'UPSTREAM') {
+            // A coalesced caller sees the same failure as the original request
+            // and must get the same last-good fallback, not the raw refusal.
+            if (!overpassPayloadIsData(preflight.payload)) {
+              const stale = await readStaleOverpass(cacheKey);
+              if (stale) {
+                sendOverpassResponse(res, stale, 'STALE');
+                return;
+              }
+            }
             if (preflight.source === 'DISK') {
               _overpassCache.set(cacheKey, preflight.payload);
               trimOverpassCache();
@@ -2671,7 +2770,11 @@ function overpassProxy() {
           _overpassConcurrent += 1;
           const requestPromise = fetchOverpassPayload(safeBody)
             .then((payload) => {
-              if (payload.status < 500 && !payload.rateLimited && !payload.runtimeError) {
+              // Only a 2xx is data. `< 500` cached every 4xx, so one mirror's
+              // refusal was written to memory AND disk — and boundary-class
+              // queries hold a month-long TTL, so a single 406 outlived the
+              // outage that caused it.
+              if (overpassPayloadIsData(payload)) {
                 const entry = { ...payload, cachedAt: Date.now() };
                 _overpassCache.set(cacheKey, entry);
                 trimOverpassCache();
@@ -2689,8 +2792,8 @@ function overpassProxy() {
           // Degraded upstream (rate-limited on every mirror / 5xx / runtime
           // error): last-good roads beat an empty layer — serve stale from
           // memory or disk at ANY age before surfacing the failure.
-          if (payload.rateLimited || payload.runtimeError || payload.status >= 500) {
-            const stale = _overpassCache.get(cacheKey) || await readOverpassDisk(cacheKey, Infinity);
+          if (!overpassPayloadIsData(payload)) {
+            const stale = await readStaleOverpass(cacheKey);
             if (stale) {
               sendOverpassResponse(res, stale, 'STALE');
               return;
@@ -2700,7 +2803,7 @@ function overpassProxy() {
         } catch (e) {
           // Every mirror threw (network-level). Same serve-stale rule.
           const stale = cacheKey
-            ? (_overpassCache.get(cacheKey) || await readOverpassDisk(cacheKey, Infinity).catch(() => null))
+            ? await readStaleOverpass(cacheKey)
             : null;
           if (stale) {
             sendOverpassResponse(res, stale, 'STALE');
@@ -3334,7 +3437,7 @@ function gbfsProxy() {
             return;
           }
           const body = await upstream.text();
-          if (body.length > GBFS_MAX_BODY_BYTES) {
+          if (Buffer.byteLength(body, 'utf8') > GBFS_MAX_BODY_BYTES) {
             res.writeHead(502, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
             res.end(JSON.stringify({ error: 'GBFS upstream response too large' }));
             return;
@@ -4057,7 +4160,7 @@ async function loadTflSourcesFromOpenData() {
         rangeM: 145,
         mountHeightM: 8,
         groundElevationM: 15, // Thames-basin prior; one-shot snap corrects.
-        feedType: 'image', // stills-first (product rule); props.videoUrl deliberately unused
+        feedType: 'image', // stills-first (owner decision); props.videoUrl deliberately unused
         url: imageUrl,
         snapshotUrl: imageUrl,
         sourceKind: 'tfl-open-data',
@@ -5174,7 +5277,7 @@ export function buildHudSummaryBody(target, context) {
  * Keeps OPENAI_API_KEY server-side while the browser connects to the
  * Realtime API over WebRTC with a short-lived secret.
  */
-function openAiRealtimeProxy() {
+export function openAiRealtimeProxy() {
   function install(middlewares) {
     middlewares.use('/api/openai/hud-summary', async (req, res) => {
       if (req.method !== 'POST') {
@@ -5184,16 +5287,20 @@ function openAiRealtimeProxy() {
         return;
       }
 
-      // Opt-in per-IP throttle (GEV_RATELIMIT_OPENAI_PER_MIN). No-op when unset.
-      if (!enforceOptInRateLimit(openAiRateLimiter(), req, res)) return;
-
-      const target = resolveHudSummaryTarget();
-      if (!target.local && !target.apiKey) {
-        res.statusCode = 503;
-        res.setHeader('Content-Type', 'application/json');
-        res.end(JSON.stringify({ error: 'OPENAI_API_KEY is not set' }));
+      const apiKey = process.env.OPENAI_API_KEY;
+      const keyless = keylessHudSummaryResponse(apiKey);
+      if (keyless) {
+        res.statusCode = keyless.statusCode;
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-store');
+        res.end(JSON.stringify(keyless.payload));
         return;
       }
+
+      // Opt-in per-IP throttle (GEV_RATELIMIT_OPENAI_PER_MIN). Keyless HUD
+      // fallback has no provider cost and resolves above without consuming a
+      // paid-endpoint quota slot.
+      if (!enforceOptInRateLimit(openAiRateLimiter(), req, res)) return;
 
       try {
         const body = await readRequestBody(req, 64 * 1024);
@@ -5317,7 +5424,70 @@ function openAiRealtimeProxy() {
             },
             output: { voice },
           },
-          instructions: GEV_REALTIME_INSTRUCTIONS,
+          instructions: [
+            "You are GEV Voice Control, a concise voice controller for a Cesium geospatial app called God's Eye View.",
+            'Have a natural spoken conversation with the user while the mic session is active.',
+            'Do not require a wake phrase. Treat direct commands like "zoom into London" or "open datacenters" as GEV control requests.',
+            'Only control the app by calling the provided tools. Never invent tool names or arguments.',
+            'Call tools only for clear GEV control, navigation, visual-style, layer, or app-state requests. For ordinary conversation, answer normally without tools.',
+            'For requests to open, show, reveal, or focus a menu/panel, call set_panel_open or show_data_layers_menu. "Open Context" means only set_panel_open{panelId:"global-context-panel",open:true}; it does not activate a Context sub-mode. "Open Contacts" means set_context_mode{mode:"contacts"}; that action expands the parent Context panel before activating Contacts.',
+            'For requests like "show me the datacenter layers", open the data layers menu and focus the matching layer row; do not enable the layer unless the user asks to turn it on.',
+            'For questions like "what am I looking at?", "what is in view?", "what is this?", "that selected thing", nearby datacenter, dam, cable, ship, or current view contents, call get_entity_context first, then answer from the returned scene/entity context.',
+            'For "what is this aircraft?" answers, read the callsign, operator, registration, type, and route only from get_entity_context selected.properties. Treat route, routeOrigin, and routeDestination as the only authoritative route fields. Every aircraft identity answer MUST explicitly cover operator, type, and route. When a route is present, repeat its endpoint codes exactly; do not expand airport codes into city names. For a missing field say exactly "Operator details are unavailable", "Aircraft type is unavailable", or "Route details are unavailable" as applicable. Never silently omit missing enrichment or infer it from the callsign.',
+            'While a camera motion or route flight is active, a bare "stop" means move_camera{motion:stop} — NOT control_scene and NOT stop_tracking (those need explicit words like "stop the scene" / "stop tracking"). If move_camera stop returns stopped:false and an entity is being tracked, call stop_tracking next — the user means "stop whatever is moving". Flying somewhere while tracking automatically stops the tracking (the result says so): mention it briefly.',
+            'For camera-motion requests — "orbit around this", "pan left", "tilt up", "stop moving" — call move_camera. For "fly the route" over a drawn route, call fly_route. Confirm with the RESULTING state ("Orbiting slowly", "Flying the route").',
+            'analyst_query ANSWERS questions; it never moves the camera or starts tracking. For requests to FOLLOW or TRACK a specific aircraft/ship, call track_entity (get_entity_context first when the target is ambiguous), never analyst_query as the final or only action. For "follow/track the nearest aircraft", first call analyst_query with the aircraft layer(s), sortBy=distance, and limit=1, then call track_entity with the returned aircraft identity in the same turn. The lookup alone does not fulfill a follow/track command.',
+            'For a request to enable an aircraft layer and SELECT or FIND the nearest/closest aircraft near a named place — for example, "Turn on flights and select the closest aircraft to Austin" — call select_nearest_aircraft once. It atomically turns on the requested aircraft layer first, waits for location arrival, refreshes that layer for the destination viewport, filters out landed/on-ground records, and selects the nearest airborne result. A healthy fallback feed is valid data: report the returned feed source briefly, never call it an enable failure. Do not also call fly_to_location, set_layer_visibility, analyst_query, track_entity, set_context_mode, or control_cockpit for the same request. SELECT/FIND never implies Contacts or Cockpit unless the user explicitly asks for either mode.',
+            'For ANALYTICAL questions about layer data — how many / which / fastest / highest / biggest / nearest flights, ships, fires, or earthquakes ("how many flights over Texas", "biggest fire near LA", "which ships are headed to Oakland", "anything above 40,000 feet") — call analyst_query, not get_entity_context. Narrate the count plus two or three notable examples by name, and reflect the result\'s coverage note honestly: the answer covers data loaded by enabled layers, not the whole world. If the needed layer is disabled, say so and offer to enable it. For follow-ups about the same set ("which of THOSE is closest?"), call analyst_query with followUp=true and only the new filter/sort.',
+            'COUNTING CONTRACT — what "near" means. (1) While Contacts is ACTIVE, "near / nearby / how many aircraft" means the Contacts window: answer from contactsWindow in the tool result — those are the exact numbers on the user\'s panel. set_context_mode, analyst_query, and get_current_view_state carry it after Contacts settles. For "Open Contacts and tell me how many aircraft are within 250 km", call set_context_mode{mode:"contacts"} first and answer from contactsWindow.aircraft; do not answer from a pre-Contacts analyst query. analyst_query\'s own count measures currently-loaded records and is usually lower; never give it as the window count. CENTER PRECEDENCE for a nearby/how-many ask, in order: an explicit place in the question ("over Texas", "near Austin") always wins and ignores Contacts state; else the CONTACTS SUBJECT when Contacts is active and has one — a selected datacenter, dam, fire, or cable does NOT silently become the center; else an entity the user explicitly names ("around this datacenter"); else the current view, said aloud ("nothing is selected, so this is the current view"). With Contacts active but NO subject yet, use the view and say so; never read an empty panel. (2) With Contacts OFF, "nearby" means in view; "near <place>" means a radius around that place. (3) EVERY count names its scope in words — "42 in your window", "8 in view", "about 30 within 250 km of Austin" — never a bare number; analyst_query returns scopeLabel for exactly this. Two different numbers with named scopes are not a contradiction; say both if asked. (4) State counts VERBATIM — never estimate, round, or hedge ("a few", "less than a dozen"): if a tool returns 46, say 46. (5) When it matters, add once: counts cover loaded data, and the flights layer loads where you look.',
+            'While Cockpit is active, navigate with control_cockpit (next/previous, optionally targetLayer or aircraftClass). track_entity and fly_to_location are REFUSED by design while Cockpit owns the camera — that refusal is correct, not an error to retry. To go somewhere else, exit Cockpit first. control_cockpit enter establishes Contacts itself, so do not call set_context_mode before or after it.',
+            'When the target layer is unknown, OMIT layerId in track_entity so it searches all enabled layers. Passing the wrong layerId ("flights" for a military contact) returns "Nothing matched" even though the contact is loaded.',
+            'If get_entity_context has no selected object or overlay entities, use its basemap context: Google Photorealistic 3D Tiles/Cesium source, center target coordinates, reverse-geocoded place, camera altitude, active style, and enabled layers. Do not say there is nothing unless the basemap target is also unavailable.',
+            'If basemap context includes knownLandmarks, prefer the nearest known landmark by name for "what am I looking at" answers. For example, if knownLandmarks includes Eiffel Tower, say Eiffel Tower.',
+            'At local zoom, use basemap nearbyPlaces, place.labels, viewportPlaces.visibleLabels, and viewportPlaces.streetLabels to identify the building, premises, roads, and named places visible around the screen target.',
+            'If basemap context includes viewportPlaces, prefer dominantCountry, dominantRegion, and dominantLocality over raw coordinates.',
+            'When basemap context includes viewportSamples or an inferred country, trust that over a single reverse-geocoded address. If most samples indicate Iran, say Iran, not the United States.',
+            'When a viewport screenshot is attached after get_entity_context, read clearly legible street, building, and place labels from it and combine them with structured label context. Respect scene viewScale: at global/continental/regional scale, avoid naming a precise street/city from one center pixel.',
+            'Do not mention disabled layers or stale selections.',
+            'When a request requires a tool call, do not speak in the same response as the tool call. Call the tool first.',
+            'When a single user request contains MULTIPLE changes (e.g. "switch to operator layout, use balanced detection at density 50, and switch to Bing aerial"), call ALL the corresponding tools — multiple tool calls in sequence — before speaking. Never confirm a partial subset. If a later tool fails, say which parts succeeded and which failed.',
+            'After receiving tool output, speak exactly one short confirmation. Do not repeat the confirmation.',
+            'For "show/open/turn on" layer requests, enable the matching layer. For "hide/close/turn off", disable it.',
+            // INSTRUCTION-ONLY mapping for the two globe-scale named views.
+            //
+            // Both are BROADER than the first-run tiles on purpose. A person
+            // naming layers out loud has chosen them; a tile is a first
+            // impression handed to a stranger. So voice keeps fires in the
+            // environmental view and keeps infrastructure entirely, while the
+            // launcher's ENVIRONMENTAL tile is quakes-only and has no
+            // infrastructure tile at all. See src/firstRunExperience.js for why.
+            //
+            // Fully expressible with tools that already exist, so
+            // GEV_REALTIME_TOOLS is deliberately untouched — deleting this one
+            // string is the whole rollback.
+            'NAMED VIEWS are shorthand for tool calls you already have — there is no "mode" tool for them. Treat ONLY these as the shorthand: "infrastructure mode" / "the infrastructure view" / "show me global infrastructure" means three set_layer_visibility calls (local-datacenters, local-dams, telegeography-submarine-cables) plus zoom_to_globe; "environmental mode" / "earth watch" / "active events", said as the name of a view, means set_layer_visibility for local-firms and earthquakes plus zoom_to_globe. Anything vaguer is NOT this shorthand — an open-ended question about the world or the news is an ordinary question: answer it, or use analyst_query over the layers already on. Never switch a whole view on to answer a question nobody asked to see. When you do run one, make every call before speaking, then give one confirmation naming the resulting state; if the fires layer comes back unavailable because no FIRMS key is configured, say so plainly — the earthquakes still loaded. "Live contacts" and "space missions" are NOT this pattern: they stay set_context_mode{mode:"contacts"} and set_context_mode{mode:"space-missions"}.',
+            'For visual filter requests, call set_visual_style with one of the allowed style IDs.',
+            'Disambiguation table — basemap vs layer vs style: basemap switching requires an explicit stack name — "Bing aerial" means set_map_stack bing-aerial, "aerial with labels" means bing-labels, "OSM"/"road map" means osm, "Esri"/"Esri imagery" means esri-imagery, "Google 3D"/"photorealistic" means photoreal. Any mention of "satellite" or "satellites" ALWAYS means the satellites DATA LAYER via set_layer_visibility, never a basemap. "surveillance"/"night vision"/"thermal" are visual STYLES via set_visual_style.',
+            'HUD requests ("hud on/off", "switch to operator/minimal/tactical layout") use set_hud. Detection requests ("detection on", "dense mode", "balanced mode", "sparse mode", "set density to 25", "use weighted allocation") use set_detection. Density snaps to 0/25/50/75/100 and derives Sparse/Balanced/Dense; panoptic is a legacy alias for Dense.',
+            'Bloom/sharpen requests use set_post_processing. Scene requests ("play orbital watch", "stop the scene", "what scenes are there") use control_scene. CCTV camera requests ("next camera", "nearest camera", "select the Congress camera", "show coverage") use control_cctv — the CCTV layer must be enabled first.',
+            'Radio playback requests use control_radio. "Turn on/start the radio" means action=play; action=enable only reveals Radio markers and must be reserved for explicit "show/enable the Radio layer/markers" requests. After a prepared playback result, briefly confirm any other completed actions and say "Turning on the radio"—never claim it is already playing. The client keeps Radio muted until playback is verified, then closes voice before restoring Radio volume. Examples: "play news near Austin" → select category=news locationId=austin; "play US news" → select category=news country=US; "Radio volume 30" → volume; pause/resume/stop/next/previous use the matching action. Radio selection never moves the camera.',
+            '"Track/follow <something specific>" (a callsign, ship name, satellite name) uses track_entity. "Take me to the biggest fire" uses track_entity with query "biggest fire" (the fires layer must be enabled). Bare "orbit" means camera orbit of the current landmark. "Stop following/tracking" uses stop_tracking.',
+            '"Show me which planes are overhead"/"frame the ships"/"show me the satellites above" use frame_overhead with the matching target.',
+            "After frame_overhead, speak ONLY from the tool result's count field — e.g. 'Framed fourteen aircraft, labels on'; never reassess or second-guess the count aloud.",
+            'Confirmations echo the RESULTING state, never the request: "HUD operator layout", "Density twenty-five percent", "Bing aerial imagery", "Tracking UAL428", "Framed fourteen aircraft". On ok=false, state the failure plainly: "Nothing matched UAL999", "No ships within 120 kilometers". Never claim an action without ok=true in the tool result.',
+            'For destination requests such as "take me to Italy", "go to NYC", or "show me the Eiffel Tower", call fly_to_location. Prefer known city IDs when available; otherwise pass the plain place query.',
+            'Navigation-only requests ("take me to X", "go to X", "fly to X") are NOT descriptions: call fly_to_location alone and do NOT also call annotate_map, unless the user explicitly asks to mark the place or you go on to explain specific places there. Never drop a point pin on a region-scale natural feature (a mountain range, desert, sea, or forest) — a single point in the middle of the Rockies is meaningless. If the user explicitly asks to mark such a region, prefer type=area.',
+            'For country and city destinations, omit rangeM so GEV frames the whole country or city in view. For landmarks and buildings, omit rangeM so GEV chooses a close landmark view.',
+            'Only supply rangeM when the user asks for a particular numeric height, distance, closer view, or wider view.',
+            'For relative requests such as "zoom out a little", "pull back", "zoom in more", or "get closer", always call adjust_camera_zoom. But "globe view", "whole earth", "the whole planet", or "zoom all the way out" is an ABSOLUTE framing: call zoom_to_globe once instead — repeated adjust_camera_zoom calls can never reach the globe. Never claim the camera moved without the tool returning ok=true.',
+            'Keep spoken confirmations short, e.g. "Opening datacenters" or "Flying to London".',
+            'WHITEBOARD THE WORLD: whenever you describe or explain a specific place, building, campus, district, boundary, or a spatial relationship between places, call annotate_map to mark it visually as you talk — like sketching on the map. To call out a specific building, campus, compound, park, or district, use type=area (it traces and encloses the real footprint — a building gets a glowing volume, a district gets a draped outline). Use type=highlight only for a transient pulse on a precise spot that has no meaningful footprint, and type=pin to drop a labeled marker. Examples: "what is the Palace of Fine Arts?" → an AREA on it; "the old military base next to it" → an AREA on the Presidio; "ILM is right here" → a pin; "it sits next to the Marina" → an arrow from one to the other. Prefer place NAMES so the app resolves real positions and outlines; never invent coordinates or pixel locations.',
+            'On every annotation, also set entityKind to what the thing IS when you know it: building (one structure), compound (campus/grounds/mall/park), district (neighborhood/area of a city), street (a named road), or point_feature (a monument, statue, memorial, plaque, fountain, or other small point landmark). entityKind is a FACT about the target, independent of the mark type you chose — monuments and statues are point_feature even when you use type=area; the app then anchors them as precise points instead of guessing at a footprint.',
+            'Use a single annotate_map call with several annotations when you are describing multiple related places at once. Set flyTo true only when the user is not already looking at the place; if every mark in a call lands off-screen the app auto-frames them, so when unsure leave flyTo false. Do NOT say out loud that you are drawing, highlighting, or annotating — just speak naturally about the places while the marks appear. ANNOTATIONS ACCUMULATE AND PERSIST — keep adding marks as you explore; you can fly around, change topic, and jump between far-apart places and the marks STAY, so the user can build up the map and show people things. Do NOT clear on your own initiative: never pass clearPrevious, and call clear_annotations ONLY when the user EXPLICITLY asks to clear or reset the map.',
+            'If an annotate_map result has partial:true or any failedLabels, do not pretend those places appeared — briefly work into your narration that you could not pinpoint them (e.g. "I couldn\'t place X"). If a route comes back as a direct line (no street route was found), describe it as a straight-line distance, not a walking/driving time. If an annotate_map result has capped:true, the map is full — ASK the user whether to clear before drawing more; do not clear unprompted. outlinePending:true is NOT a failure, but it is also NOT an outline: the anchor mark is placed and the boundary is still being traced in the background. Narrate it in progress — e.g. "tracing the boundary now" — and NEVER state the outline is already drawn or visible; it may yet come back as just a point. A later system item of type map_annotation_outline reports the final outcome per mark (status resolved or failed, with its label): use it to quietly confirm, or to correct yourself if you implied a boundary that stayed a point — an honest miss beats a misleading guess.',
+            'PREFER NAMES. Only when you cannot name or geocode a place but you can clearly SEE the exact spot in the most recent viewport screenshot, fall back to screenX/screenY (normalized 0..1 from that image) to point at it; the app converts the pixel to a real world point. Never use screenX/screenY for something you could name.',
+            'PATHS vs DISTANCES: for "walking/driving route from A to B" (or through several stops), use type=route with the ordered points and the matching mode (walking/driving/cycling) — the app draws the real street-following path on the map and reports distance and travel time, which you can read aloud. For "how far is X from Y", "is it nearby", or "X is next to Y", use type=arrow between the two — it draws a floating connector and shows the straight-line distance. Do NOT use route for a simple distance/proximity question.',
+          ].join('\n'),
           tools: GEV_REALTIME_TOOLS,
           tool_choice: 'auto',
         },
@@ -5426,19 +5596,45 @@ function readRequestBody(req, maxBytes = 1024 * 1024) {
 }
 
 /**
+ * Optional Google place context is an empty capability when no key is present,
+ * not a server outage. Returning 200 keeps a deliberately keyless session out
+ * of the browser error console while preserving an explicit configured flag.
+ */
+export function keylessGooglePlacesResponse(apiKey) {
+  if (String(apiKey ?? '').trim()) return null;
+  return {
+    statusCode: 200,
+    payload: { configured: false, error: null, places: [] },
+  };
+}
+
+/**
  * Vite plugin: nearby Google place labels for Realtime scene context.
  *
  * The Photorealistic 3D Tiles mesh does not expose rendered map labels as
  * Cesium feature metadata. Nearby Search supplies the names around the actual
  * screen-space target without exposing the Google API key in the request.
  */
-function googlePlacesContextProxy() {
+export function googlePlacesContextProxy() {
   function install(middlewares) {
     middlewares.use('/api/google/nearby-places', async (req, res) => {
       if (req.method !== 'GET') {
         res.statusCode = 405;
         res.setHeader('Content-Type', 'application/json');
         res.end(JSON.stringify({ error: 'Method not allowed', places: [] }));
+        return;
+      }
+
+      // Keyless place context has no provider cost, so it resolves before the
+      // paid-endpoint limiter can consume or exhaust quota (mirrors the HUD
+      // summary route).
+      const apiKey = process.env.GOOGLE_MAPS_API_KEY;
+      const keyless = keylessGooglePlacesResponse(apiKey);
+      if (keyless) {
+        res.statusCode = keyless.statusCode;
+        res.setHeader('Content-Type', 'application/json');
+        res.setHeader('Cache-Control', 'no-store');
+        res.end(JSON.stringify(keyless.payload));
         return;
       }
 
@@ -5451,14 +5647,6 @@ function googlePlacesContextProxy() {
         res.setHeader('Content-Type', 'application/json');
         res.setHeader('Retry-After', '5');
         res.end(JSON.stringify({ error: 'Rate limit exceeded', places: [] }));
-        return;
-      }
-
-      const apiKey = process.env.GOOGLE_MAPS_API_KEY;
-      if (!apiKey) {
-        res.statusCode = 503;
-        res.setHeader('Content-Type', 'application/json');
-        res.end(JSON.stringify({ error: 'GOOGLE_MAPS_API_KEY is not set', places: [] }));
         return;
       }
 
@@ -5556,6 +5744,19 @@ function googlePlacesContextProxy() {
         return;
       }
 
+      // Keyless place context has no provider cost, so it resolves before the
+      // paid-endpoint limiter can consume or exhaust quota (mirrors the HUD
+      // summary route).
+      const apiKey = process.env.GOOGLE_MAPS_API_KEY;
+      const keyless = keylessGooglePlacesResponse(apiKey);
+      if (keyless) {
+        res.statusCode = keyless.statusCode;
+        res.setHeader('Content-Type', 'application/json');
+        res.setHeader('Cache-Control', 'no-store');
+        res.end(JSON.stringify(keyless.payload));
+        return;
+      }
+
       // Opt-in per-IP throttle (GEV_RATELIMIT_GOOGLE_PER_MIN). No-op when unset.
       // Inlined (like nearby-places) so the 429 body keeps the `places: []`
       // contract the client expects on every error response.
@@ -5565,14 +5766,6 @@ function googlePlacesContextProxy() {
         res.setHeader('Content-Type', 'application/json');
         res.setHeader('Retry-After', '5');
         res.end(JSON.stringify({ error: 'Rate limit exceeded', places: [] }));
-        return;
-      }
-
-      const apiKey = process.env.GOOGLE_MAPS_API_KEY;
-      if (!apiKey) {
-        res.statusCode = 503;
-        res.setHeader('Content-Type', 'application/json');
-        res.end(JSON.stringify({ error: 'GOOGLE_MAPS_API_KEY is not set', places: [] }));
         return;
       }
 
@@ -6109,8 +6302,8 @@ export const GEV_REALTIME_TOOLS = [
       properties: {
         stack: {
           type: 'string',
-          enum: ['photoreal', 'bing-aerial', 'bing-labels', 'osm'],
-          description: 'photoreal = Google 3D. Use bing-aerial only when the user explicitly says "Bing aerial" — "satellite(s)" never means a basemap.',
+          enum: ['photoreal', 'bing-aerial', 'bing-labels', 'esri-imagery', 'osm'],
+          description: 'photoreal = Google 3D. Use bing-aerial only when the user explicitly says "Bing aerial" — "satellite(s)" never means a basemap; only the explicit phrase "Esri" / "Esri imagery" means esri-imagery.',
         },
       },
       required: ['stack'],
@@ -6834,7 +7027,7 @@ export const MILITARY_INSTALLATION_ELEMENT_CAP = 700;
 /**
  * Disk-cache TTL for mapped installations (ms) — 30 days.
  *
- * Field test 2026-08-18: "search nearby sites" was slow because every look
+ * Owner playtest 2026-08-18: "search nearby sites" was slow because every look
  * around paid a live Overpass round trip, and the 5-minute in-memory tier died
  * with the dev server. Mapped military features change on a survey timescale,
  * not a session one, so a month-old answer is still the right answer — the same
@@ -7031,6 +7224,12 @@ function trimMilitaryInstallationCache() {
   }
 }
 
+/** Safe, evidence-based reason for an installation upstream failure. */
+export function militaryInstallationFailureReason(error) {
+  if (['rate_limited', 'timeout', 'query_failed'].includes(error?.installationReason)) return error.installationReason;
+  return ['AbortError', 'TimeoutError'].includes(error?.name) ? 'timeout' : 'unavailable';
+}
+
 function militaryInstallationsProxy() {
   async function refresh(box, key) {
     const bbox = `${box.south},${box.west},${box.north},${box.east}`;
@@ -7040,7 +7239,11 @@ function militaryInstallationsProxy() {
       MILITARY_INSTALLATION_MAX_RESPONSE_BYTES,
     );
     if (upstream.status >= 400 || upstream.rateLimited || upstream.runtimeError) {
-      throw new Error('Mapped installation upstream unavailable');
+      throw Object.assign(new Error('Mapped installation upstream unavailable'), {
+        installationReason: upstream.rateLimited ? 'rate_limited'
+          : upstream.status === 504 ? 'timeout'
+            : upstream.runtimeError ? 'query_failed' : 'unavailable',
+      });
     }
     const parsed = JSON.parse(upstream.body);
     const elements = Array.isArray(parsed?.elements)
@@ -7139,7 +7342,7 @@ function militaryInstallationsProxy() {
           return;
         }
         res.writeHead(503, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
-        res.end(JSON.stringify({ error: 'Mapped installation context is temporarily unavailable' }));
+        res.end(JSON.stringify({ error: 'Mapped installation context is temporarily unavailable', reason: militaryInstallationFailureReason(error) }));
       }
     });
   }
@@ -7585,6 +7788,264 @@ function normalizeAisTimestamp(value) {
 }
 
 /**
+ * In-app key setup ("POWER UP" panel) — dev-server only.
+ *
+ * GET  /api/setup/status → which keys are configured, as presence plus a
+ *   source classification. Never a value or suffix. The panel renders itself entirely from
+ *   this payload, so the key registry stays in one place (src/keySetupCore.mjs).
+ * POST /api/setup/keys → validate {ENV_VAR: value} pairs and upsert them into
+ *   the repo-root .env (created if absent), set process.env live, then restart
+ *   the dev server so the client-exposed defines re-inject and the page
+ *   reloads itself. Pasting a key in the app IS the whole setup — no
+ *   hand-edited env files.
+ *
+ * Loopback-only on purpose: with HOST=0.0.0.0 the app can be shared on a LAN,
+ * and a guest must be able to neither write the host's .env nor probe which
+ * keys exist. Prod builds never register this middleware (apply: 'serve'), so
+ * the panel's status fetch fails and the client removes the whole surface.
+ */
+function keySetupEndpoint() {
+  const respond = (res, statusCode, payload) => {
+    res.statusCode = statusCode;
+    res.setHeader('Content-Type', 'application/json');
+    // A credential-status response must never be cached by a proxy or the disk
+    // cache, and the surface must never be framed (clickjacking a same-origin
+    // REMOVE/replace past the Origin check).
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('Content-Security-Policy', "frame-ancestors 'none'");
+    res.end(JSON.stringify(payload));
+  };
+  // Which store this launch owns. A Pinokio-managed launch (marker set by
+  // scripts/pinokio-start.mjs) writes the app-scoped pinokio/ENVIRONMENT that
+  // applyPinokioEnvironment() treats as authoritative; every other launch
+  // writes the repo-root .env that Vite's loadEnv reads. The panel never
+  // touches a store some other workflow owns.
+  // The launcher marker is read from the BOOT environment captured before
+  // Vite's loadEnv merges dotenv files into process.env — otherwise a stray
+  // `GEV_LAUNCHER=pinokio` line in someone's .env would silently redirect a
+  // plain `npm run dev` to write the Pinokio store it never loaded.
+  const pinokioManaged = () => LAUNCHER_AT_BOOT === 'pinokio';
+  const storeName = () => (pinokioManaged() ? 'pinokio-environment' : 'env-file');
+  const storePath = () => path.join(__dirname, ...(pinokioManaged() ? ['pinokio', 'ENVIRONMENT'] : ['.env']));
+  // Read the store, distinguishing "no store yet" from "cannot read this
+  // store". Only ENOENT means empty. Every other failure — a permission error,
+  // an I/O fault, an undecodable file — must ABORT the save: upserting into a
+  // wrongly-empty string and atomically replacing the file would destroy every
+  // other provider key the user had configured.
+  const readStore = () => {
+    try {
+      // The Pinokio launcher deliberately supports a UTF-16 ENVIRONMENT (a
+      // Windows editor or the native Configure panel can write one). Reuse its
+      // own encoding-aware decoder so a panel write can never mistake UTF-16
+      // bytes for UTF-8, corrupt the file, and wedge the next launch. We always
+      // write back UTF-8, which is exactly what the launcher normalizes to.
+      if (pinokioManaged()) return readPinokioEnvironmentSource(storePath());
+      return fs.readFileSync(storePath(), 'utf8');
+    } catch (error) {
+      if (error?.code === 'ENOENT') return ''; // The first saved key births the file.
+      const unreadable = new Error('the existing configuration could not be read, so nothing was changed');
+      unreadable.code = 'GEV_STORE_UNREADABLE';
+      throw unreadable;
+    }
+  };
+  // Status must never fail because the store is unreadable — it reports the
+  // LIVE environment, and an unreadable store only costs file/external
+  // attribution. Persistence uses readStore() directly and refuses instead.
+  const storeValues = () => {
+    try {
+      return parseDotenvText(readStore());
+    } catch {
+      return {};
+    }
+  };
+  // The gate itself is pure and unit-tested (admitKeySetupRequest in
+  // src/keySetupCore.mjs) — this just feeds it the request.
+  const admit = (req) => admitKeySetupRequest({
+    method: req.method,
+    remoteAddress: req.socket?.remoteAddress,
+    hostHeader: req.headers?.host,
+    protocol: req.socket?.encrypted ? 'https:' : 'http:',
+    origin: req.headers?.origin,
+    contentType: req.headers?.['content-type'],
+    proxyHeaders: req.headers || {},
+    env: process.env,
+  });
+  // Is this env var supplied by a workflow OTHER than this panel's store? Boot
+  // provenance closes the equal-value ambiguity: an exported X remains
+  // external even when the editable store independently contains X.
+  const isExternallyManaged = (name, inStore) => {
+    const wasExternalAtBoot = pinokioManaged()
+      ? false
+      : LAUNCHER_AT_BOOT === 'dev-fresh'
+        ? DEV_FRESH_EXTERNAL_KEYS_AT_BOOT.has(name)
+        : PROVIDER_ENV_AT_BOOT[name] !== '';
+    return isKeySetupExternallyManaged({
+      effectiveValue: process.env[name],
+      storedValue: inStore[name],
+      wasExternalAtBoot,
+    });
+  };
+  const providerStatus = () => {
+    const inStore = storeValues();
+    const status = keySetupStatus(process.env);
+    for (const key of status.keys) {
+      // 'file' = this panel's own store holds exactly this value (replace/remove
+      // offered); 'external' = supplied by env/Keychain/another workflow
+      // (read-only — the panel must never rewrite or delete it).
+      key.managed = key.set
+        ? (key.envVars.some((name) => isExternallyManaged(name, inStore)) ? 'external' : 'file')
+        : null;
+    }
+    return { ...status, store: storeName() };
+  };
+  // Atomically replace the store's content: fresh same-dir temp created 0600
+  // with the exclusive flag, fsync, rename over the target. Closes the window
+  // where writeFileSync leaves a 0644 file holding a real key before any later
+  // chmod, and the truncate-in-place data-loss path.
+  const persistStore = (text) => {
+    const filepath = storePath();
+    // Never write THROUGH a symlink into a credential path.
+    try {
+      if (fs.lstatSync(filepath).isSymbolicLink()) {
+        throw new Error('refusing to write a credential store that is a symlink');
+      }
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error; // absent is fine — first save.
+    }
+    // Random suffix, not the pid: a stale temp from a failed rename would
+    // otherwise make every later save in this process fail EEXIST forever.
+    const tmp = path.join(
+      path.dirname(filepath),
+      `.${path.basename(filepath)}.${randomUUID().slice(0, 8)}.tmp`,
+    );
+    const fd = fs.openSync(tmp, 'wx', 0o600);
+    let staged = false;
+    try {
+      // Restrict the EMPTY temp file BEFORE the secret touches it. On Windows
+      // a fresh file inherits the directory's ACL (world-readable under a
+      // C:-rooted Pinokio home) and the 0600 open mode is a no-op — and NTFS
+      // renames carry the file object's ACL with it, so hardening the temp IS
+      // hardening the final file. Ordering this before the write means a
+      // hardening failure aborts with the previous store fully intact and the
+      // secret never on disk unprotected — no rollback path to get wrong.
+      if (!hardenCredentialFile(tmp)) {
+        const error = new Error('could not restrict the credential file to your account; nothing was saved');
+        error.code = 'GEV_HARDEN_FAILED';
+        throw error;
+      }
+      // writeSync may write fewer bytes than asked; loop until the whole
+      // buffer lands or a truncated store gets fsynced and renamed into place.
+      const buffer = Buffer.from(text, 'utf8');
+      let written = 0;
+      while (written < buffer.length) {
+        written += fs.writeSync(fd, buffer, written, buffer.length - written);
+      }
+      fs.fsyncSync(fd);
+      staged = true;
+    } finally {
+      fs.closeSync(fd);
+      if (!staged) fs.rmSync(tmp, { force: true });
+    }
+    try {
+      fs.renameSync(tmp, filepath);
+    } catch (error) {
+      // Never strand a staged secret on disk when the swap itself fails.
+      fs.rmSync(tmp, { force: true });
+      throw error;
+    }
+  };
+  return {
+    name: 'gev-key-setup',
+    // serve AND not preview: `vite preview` resolves with command 'serve' too,
+    // so a bare apply:'serve' would still configure under preview. The endpoints
+    // only install via configureServer (never configurePreviewServer), so they
+    // are absent from preview today — but pinning apply here makes that a
+    // guarantee rather than an accident of which hook a future edit uses.
+    apply: (_config, { command, isPreview }) => command === 'serve' && !isPreview,
+    configureServer(server) {
+      server.middlewares.use('/api/setup/status', (req, res) => {
+        if (req.method !== 'GET') return respond(res, 405, { error: 'Method not allowed' });
+        const admission = admit(req);
+        if (!admission.ok) return respond(res, admission.status, { error: admission.error });
+        respond(res, 200, providerStatus());
+      });
+      server.middlewares.use('/api/setup/keys', (req, res) => {
+        if (req.method !== 'POST') return respond(res, 405, { error: 'Method not allowed' });
+        const admission = admit(req);
+        if (!admission.ok) return respond(res, admission.status, { error: admission.error });
+        let body = '';
+        let overflowed = false;
+        req.on('data', (chunk) => {
+          body += chunk;
+          if (body.length > 8192) {
+            overflowed = true;
+            req.destroy();
+          }
+        });
+        req.on('end', () => {
+          if (overflowed) return respond(res, 413, { error: 'Request too large' });
+          let parsed;
+          try {
+            parsed = JSON.parse(body || '{}');
+          } catch {
+            return respond(res, 400, { error: 'Invalid JSON' });
+          }
+          const verdict = validateKeySetupUpdates(parsed);
+          if (!verdict.ok) return respond(res, 400, { error: verdict.error });
+          // Neither a replace NOR a removal may touch an externally-supplied
+          // credential (shell env, Keychain, another workflow). This backs the
+          // UI's read-only "configured externally" state with a real contract —
+          // and it must guard replace too, not just remove: a clickjacked or
+          // scripted same-origin POST could otherwise overwrite the live value.
+          const inStore = storeValues();
+          for (const name of Object.keys(verdict.updates)) {
+            if (isExternallyManaged(name, inStore)) {
+              return respond(res, 409, {
+                error: `${name} is configured outside Provider Settings and can only be changed where it was set`,
+              });
+            }
+          }
+          try {
+            persistStore(upsertDotenvValues(readStore(), verdict.updates));
+          } catch (error) {
+            // The hardening failure carries its own honest, path-free message —
+            // "saved world-readable" must never be reported as a generic write
+            // error. Everything else returns a fixed message (a raw filesystem
+            // error can carry an absolute path; that stays in the server log).
+            if (error?.code === 'GEV_HARDEN_FAILED' || error?.code === 'GEV_STORE_UNREADABLE') {
+              return respond(res, 500, { error: `The key was not saved: ${error.message}` });
+            }
+            return respond(res, 500, { error: `Could not write the ${storeName()} store` });
+          }
+          // Live for the server-side proxies immediately; the restart below is
+          // what re-injects the client-exposed defines (Google, Cesium ion).
+          // Removal sets '' rather than deleting: an empty value stays falsy
+          // through loadEnv after restart, matching the Pinokio launcher's own
+          // blank-field semantics.
+          for (const [name, value] of Object.entries(verdict.updates)) {
+            process.env[name] = value === null ? '' : value;
+          }
+          respond(res, 200, {
+            ok: true,
+            saved: Object.keys(verdict.updates),
+            status: providerStatus(),
+            restarting: true,
+          });
+          // One deliberate restart, after the response has flushed. Vite's own
+          // .env watcher may fire too; a second queued restart is harmless.
+          setTimeout(() => {
+            server.restart().catch((error) => {
+              console.warn('[KeySetup] Dev-server restart failed:', error?.message || error);
+            });
+          }, 250);
+        });
+      });
+    },
+  };
+}
+
+/**
  * Main Vite configuration factory.
  *
  * Loads .env files via Vite's loadEnv, registers Cesium + local proxy
@@ -7599,6 +8060,7 @@ export default defineConfig(({ mode }) => {
     if (process.env[key] === undefined) process.env[key] = val;
   }
   const env = { ...process.env };
+  const localAllowedHosts = ['localhost', '127.0.0.1', '.local'];
   return {
     plugins: [
       cesium(),
@@ -7622,14 +8084,30 @@ export default defineConfig(({ mode }) => {
       openAiRealtimeProxy(),
       localVoiceProxy(),
       googlePlacesContextProxy(),
+      keySetupEndpoint(),
     ],
     server: {
       host: env.HOST || 'localhost',
-      port: parseInt(env.PORT, 10) || 5173,
+      port: parseInt(env.PORT, 10) || 4173,
       // When binding to all interfaces, allow any host; otherwise restrict to local names
       allowedHosts: (env.HOST === '0.0.0.0' || env.HOST === '::')
         ? true
-        : ['localhost', '127.0.0.1', '.local'],
+        : localAllowedHosts,
+      fs: {
+        // Pinokio keeps optional credentials in this ignored local file.
+        deny: ['.env', '.env.*', '*.{crt,pem}', '**/.git/**', '**/ENVIRONMENT'],
+      },
+      // Framing protection belongs on the APP DOCUMENT, not on API responses:
+      // a browser evaluates frame-ancestors against the framed page's own
+      // navigation response. Without this, a hostile page could frame
+      // `/?setup=1`, align a lure over Provider Settings, and have the framed
+      // app issue a perfectly same-origin credential write that passes every
+      // Host/Origin check. These headers apply to everything this dev server
+      // serves, which is what makes that attack impossible rather than unlikely.
+      headers: {
+        'X-Frame-Options': 'DENY',
+        'Content-Security-Policy': "frame-ancestors 'none'",
+      },
     },
     // Expose selected API keys to the browser via import.meta.env.*
     define: {
